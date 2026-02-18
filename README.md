@@ -1,6 +1,7 @@
 # LoRA-Diffusion: Parameter-Efficient Lifelong Learning for Robotic Manipulation 
 
 A parameter-efficient lifelong learning framework for robotic manipulation, built on the LIBERO benchmark. It uses a task-level expert pool with frozen shared backbones and LoRA adapters to avoid catastrophic forgetting with minimal parameter overhead.
+
 ##📋 Overview
 This repository implements a novel lifelong learning framework that:
 Maintains a pool of lightweight task experts instead of full-model fine-tuning.
