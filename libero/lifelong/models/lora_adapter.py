@@ -2,6 +2,7 @@
 LoRA (Low-Rank Adaptation) Adapter for Expert Policies
 实现参数高效的专家适配头
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,10 +37,15 @@ class LoRAAdapter(nn.Module):
             freeze_bias: 冻结的偏置 b_freeze (可选)
         """
         super().__init__()
+        if rank <= 0:
+            raise ValueError("rank must be positive")
+
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.rank = rank
         self.alpha = alpha
+        # 缓存缩放项，避免在每次前向时重复做除法
+        self.scaling = alpha / rank
         
         # 低秩矩阵分解: ΔW = U * V^T
         # U: (output_dim, rank), V: (input_dim, rank)
@@ -54,7 +60,7 @@ class LoRAAdapter(nn.Module):
         self.register_buffer('freeze_bias', freeze_bias)
         
         # 初始化
-        nn.init.kaiming_uniform_(self.lora_U, a=torch.sqrt(torch.tensor(5.0)))
+        nn.init.kaiming_uniform_(self.lora_U, a=math.sqrt(5.0))
         nn.init.zeros_(self.lora_V)
         nn.init.zeros_(self.lora_bias)
         
@@ -66,24 +72,14 @@ class LoRAAdapter(nn.Module):
             output: (B, T, output_dim) 或 (B, output_dim) - 专家动作
         """
         # 计算低秩增量: ΔW * x = U * (V^T * x)
-        if x.ndim == 3:
-            # (B, T, input_dim)
-            lora_output = torch.matmul(
-                torch.matmul(x, self.lora_V),  # (B, T, rank)
-                self.lora_U.t()  # (B, T, output_dim)
-            ) * (self.alpha / self.rank)
-        else:
-            # (B, input_dim)
-            lora_output = torch.matmul(
-                torch.matmul(x, self.lora_V),  # (B, rank)
-                self.lora_U.t()  # (B, output_dim)
-            ) * (self.alpha / self.rank)
+        # torch.matmul 可同时处理 2D/3D 输入，因此这里统一计算路径
+        lora_hidden = torch.matmul(x, self.lora_V)        # (..., rank)
+        lora_output = torch.matmul(lora_hidden, self.lora_U.t()) * self.scaling  # (..., output_dim)
         
         # 如果有冻结权重, 加上冻结部分
         if self.freeze_weight is not None:
-            freeze_output = torch.matmul(x, self.freeze_weight.t())
-            if self.freeze_bias is not None:
-                freeze_output = freeze_output + self.freeze_bias
+            # F.linear 语义等价于 x @ W^T + b，且支持 2D/3D 的最后一维线性变换
+            freeze_output = F.linear(x, self.freeze_weight, self.freeze_bias)
             output = freeze_output + lora_output + self.lora_bias
         else:
             output = lora_output + self.lora_bias
