@@ -95,13 +95,15 @@ class ExpertPoolAlgo(Sequential):
             self.experts[task] = expert
         
         self.current_expert = self.experts[task]
+        # 用局部变量减少重复属性查找，逻辑与原实现等价
+        current_expert = self.current_expert
         
         # 为了兼容evaluate_one_task_success中的algo.policy.get_action()
         # 我们将policy设置为当前专家
-        self.policy = self.current_expert
+        self.policy = current_expert
         
         # 更新优化器以只优化LoRA参数
-        lora_params = list(self.current_expert.lora_adapter.parameters())
+        lora_params = list(current_expert.lora_adapter.parameters())
         self.optimizer = eval(self.cfg.train.optimizer.name)(
             lora_params, **self.cfg.train.optimizer.kwargs
         )
@@ -120,12 +122,14 @@ class ExpertPoolAlgo(Sequential):
         观察数据并更新专家 (蒸馏训练)
         """
         data = self.map_tensor_to_device(data)
+        expert = self.current_expert
+        actions = data["actions"]
         
         # 获取教师动作 (用于蒸馏)
         with torch.no_grad():
             # 简化: 直接使用真实动作作为教师动作
             # 实际应该使用扩散教师生成
-            teacher_action = data["actions"]
+            teacher_action = actions
             
             # 或者使用教师策略生成
             # teacher_data = self.current_expert.preprocess_input(data, train_mode=True)
@@ -138,13 +142,14 @@ class ExpertPoolAlgo(Sequential):
         if self.use_routing:
             # 简化: 使用均匀权重
             # 实际应该根据概念编码器计算 q(e|s_i)
-            routing_weight = torch.ones(data["actions"].shape[0], device=self.cfg.device)
+            # 使用 actions 的 dtype / device，避免不必要的类型或设备转换
+            routing_weight = actions.new_ones(actions.shape[0])
         
         # 计算损失
         self.optimizer.zero_grad()
         
         # 蒸馏损失: 专家学习教师动作
-        distill_loss = self.current_expert.compute_loss(
+        distill_loss = expert.compute_loss(
             data,
             teacher_action=teacher_action,
             routing_weight=routing_weight,
@@ -153,8 +158,8 @@ class ExpertPoolAlgo(Sequential):
         
         # 行为克隆损失: 专家学习真实动作 (可选)
         bc_loss = F.mse_loss(
-            self.current_expert.forward(data, train_mode=True),
-            data["actions"],
+            expert.forward(data, train_mode=True),
+            actions,
             reduction="mean"
         )
         
@@ -167,8 +172,8 @@ class ExpertPoolAlgo(Sequential):
         total_loss.backward()
         
         if self.cfg.train.grad_clip is not None:
-            grad_norm = nn.utils.clip_grad_norm_(
-                self.current_expert.lora_adapter.parameters(),
+            nn.utils.clip_grad_norm_(
+                expert.lora_adapter.parameters(),
                 self.cfg.train.grad_clip
             )
         
@@ -187,10 +192,6 @@ class ExpertPoolAlgo(Sequential):
         """学习单个任务"""
         self.start_task(task_id)
         
-        # 恢复对应的manipulation task ids
-        gsz = self.cfg.data.task_group_size
-        manip_task_ids = list(range(task_id * gsz, (task_id + 1) * gsz))
-        
         model_checkpoint_name = os.path.join(
             self.experiment_dir, f"task{task_id}_expert.pth"
         )
@@ -204,8 +205,6 @@ class ExpertPoolAlgo(Sequential):
         )
         
         prev_success_rate = -1.0
-        best_state_dict = self.current_expert.lora_adapter.state_dict()
-        
         cumulated_counter = 0.0
         idx_at_best_succ = 0
         successes = []
@@ -221,13 +220,13 @@ class ExpertPoolAlgo(Sequential):
             if epoch > 0:
                 self.current_expert.train()
                 training_loss = 0.0
-                for (idx, data) in enumerate(train_dataloader):
+                for _, data in enumerate(train_dataloader):
                     loss = self.observe(data)
                     training_loss += loss
                 training_loss /= len(train_dataloader)
             else:
                 training_loss = 0.0
-                for (idx, data) in enumerate(train_dataloader):
+                for _, data in enumerate(train_dataloader):
                     loss = self.eval_observe(data)
                     training_loss += loss
                 training_loss /= len(train_dataloader)
@@ -267,7 +266,6 @@ class ExpertPoolAlgo(Sequential):
                     )
                     prev_success_rate = success_rate
                     idx_at_best_succ = len(losses) - 1
-                    best_state_dict = self.current_expert.lora_adapter.state_dict()
                 
                 t1 = time.time()
                 
